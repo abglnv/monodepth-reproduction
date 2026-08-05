@@ -1,4 +1,5 @@
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.io import read_image
 import matplotlib.pyplot as plt
@@ -112,6 +113,33 @@ def warp(source_img, depth, K, pose, H, W):
     grid = to_grid_sample_coords(u, v, H, W)
     return F.grid_sample(source_img, grid, align_corners=True)
 
+class SSIM(nn.Module): 
+    def __init__(self):
+        super().__init__()
+        self.mu_pool   = nn.AvgPool2d(3, 1)
+        self.sig_pool  = nn.AvgPool2d(3, 1)
+        self.pad = nn.ReflectionPad2d(1)
+        self.C1 = 0.01 ** 2
+        self.C2 = 0.03 ** 2
+
+    def forward(self, x, y):
+        x, y = self.pad(x), self.pad(y)
+        mu_x, mu_y = self.mu_pool(x), self.mu_pool(y)
+
+        sigma_x  = self.sig_pool(x ** 2) - mu_x ** 2
+        sigma_y  = self.sig_pool(y ** 2) - mu_y ** 2
+        sigma_xy = self.sig_pool(x * y) - mu_x * mu_y
+
+        ssim_n = (2 * mu_x * mu_y + self.C1) * (2 * sigma_xy + self.C2)
+        ssim_d = (mu_x ** 2 + mu_y ** 2 + self.C1) * (sigma_x + sigma_y + self.C2)
+
+        return torch.clamp((1 - ssim_n / ssim_d) / 2, 0, 1)
+
+def photometric_loss(ssim_m, i_w, i_t, alpha=0.85):
+    l1   = (i_w - i_t).abs().mean()
+    ssim = ssim_m(i_w, i_t).mean() 
+    return alpha * ssim + (1 - alpha) * l1
+
 if __name__ == "__main__":
     target = load_image(target_loc)
     source = load_image(source_loc)
@@ -119,6 +147,8 @@ if __name__ == "__main__":
 
     K = parse_intrinsics(calib_loc, CAM)
     depth = torch.full((H, W), 20.0)
+
+    ssim_m = SSIM()       
 
     identity = torch.eye(4)
     warped_identity = warp(source, depth, K, identity, H, W)
@@ -128,9 +158,14 @@ if __name__ == "__main__":
     pose = torch.eye(4); pose[2, 3] = -1.0
     warped = warp(source, depth, K, pose, H, W)
 
+    loss_identity = photometric_loss(ssim_m, warped_identity, target).item()
+    loss_warped   = photometric_loss(ssim_m, warped,          target).item()
+    print(f"photometric loss (identity warp vs target): {loss_identity:.5f}")
+    print(f"photometric loss (moved warp   vs target): {loss_warped:.5f}")
+
     fig, ax = plt.subplots(1, 3, figsize=(18, 4))
     for a, img, t in zip(ax, [target, source, warped],
-                            ["target", "source", "warped"]):
+                         ["target", "source", "warped"]):
         a.imshow(img[0].detach().cpu().permute(1, 2, 0).clamp(0, 1))
         a.set_title(t)
         a.axis("off")
