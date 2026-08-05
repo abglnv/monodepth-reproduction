@@ -2,11 +2,57 @@ import torch
 import torch.nn.functional as F
 from torchvision.io import read_image
 import matplotlib.pyplot as plt
+import numpy as np 
 
-CAM = 3  
-target_loc = "./kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_03/data/0000000000.png"
-source_loc = "./kitti_data/2011_09_26/2011_09_26_drive_0001_sync/image_03/data/0000000001.png"
-calib_loc  = "./kitti_data/2011_09_26/calib_cam_to_cam.txt"
+CAM = 2
+DRIVE = "./kitti_data/2011_09_26/2011_09_26_drive_0001_sync"
+CALIB = "./kitti_data/2011_09_26"
+FRAME_T = "0000000000"
+FRAME_S = "0000000001"
+
+target_loc = f"{DRIVE}/image_02/data/{FRAME_T}.png"
+source_loc = f"{DRIVE}/image_02/data/{FRAME_S}.png"
+bin_loc    = f"{DRIVE}/velodyne_points/data/{FRAME_T}.bin"   
+calib_loc = "./kitti_data/2011_09_26/calib_cam_to_cam.txt"
+
+calib_cam  = f"{CALIB}/calib_cam_to_cam.txt"    # P_rect_02, R_rect_00
+calib_velo = f"{CALIB}/calib_velo_to_cam.txt"   # R, T  (LiDAR -> camera)
+
+def read_calib(path, key): 
+    with open(path) as f: 
+        for line in f: 
+            if line.startswith(key + ":"): 
+                return [float(x) for x in line.split()[1:]]
+
+def lidar_to_depth(bin_path, cam_calib, velo_calib, H, W, cam=2): 
+    pts = np.fromfile(bin_path, dtype=np.float32).reshape(-1, 4)
+    pts[:, 3] = 1.0
+    pts = torch.tensor(pts).T     
+
+    R = torch.tensor(read_calib(velo_calib, "R")).reshape(3, 3)
+    T = torch.tensor(read_calib(velo_calib, "T")).reshape(3, 1)
+    Tr = torch.eye(4); Tr[:3, :3] = R; Tr[:3, 3:] = T
+
+    # recitification for kitti 
+    R_rect = torch.eye(4)
+    R_rect[:3, :3] = torch.tensor(read_calib(cam_calib, "R_rect_00")).reshape(3, 3)
+
+    P = torch.tensor(read_calib(cam_calib, f"P_rect_0{cam}")).reshape(3, 4)
+
+    # projection 
+    cam_pts = R_rect @ Tr @ pts    
+    depth = cam_pts[2]              
+    img = P @ cam_pts                 
+    u = (img[0] / img[2]).round().long()
+    v = (img[1] / img[2]).round().long()
+
+    valid = (depth > 0) & (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    u, v, d = u[valid], v[valid], depth[valid]
+
+    depth_map = torch.zeros(H, W)
+    order = torch.argsort(d, descending=True)   
+    depth_map[v[order], u[order]] = d[order]
+    return depth_map                
 
 def load_image(path):
     img = read_image(path).float() / 255.0
@@ -72,18 +118,21 @@ if __name__ == "__main__":
     _, _, H, W = target.shape
 
     K = parse_intrinsics(calib_loc, CAM)
-    depth = torch.full((H, W), 20.0)          
+    depth = torch.full((H, W), 20.0)
 
     identity = torch.eye(4)
     warped_identity = warp(source, depth, K, identity, H, W)
-    diff = (warped_identity - target).abs().mean().item()
+    diff = (warped_identity - source).abs().mean().item()
     print(f"identity-pose mean abs diff (should be ~0): {diff:.5f}")
 
-    pose = torch.eye(4); pose[2, 3] = -1.0      
+    pose = torch.eye(4); pose[2, 3] = -1.0
     warped = warp(source, depth, K, pose, H, W)
 
     fig, ax = plt.subplots(1, 3, figsize=(18, 4))
     for a, img, t in zip(ax, [target, source, warped],
-                         ["target", "source", "warped"]):
-        a.imshow(img[0].permute(1, 2, 0).clamp(0, 1)); a.set_title(t); a.axis("off")
-    plt.savefig("warp_result.png"); print("saved warp_result.png")
+                            ["target", "source", "warped"]):
+        a.imshow(img[0].detach().cpu().permute(1, 2, 0).clamp(0, 1))
+        a.set_title(t)
+        a.axis("off")
+    plt.savefig("warp_result.png")
+    print("saved warp_result.png")
