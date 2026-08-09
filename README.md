@@ -1,5 +1,7 @@
 # Self-Supervised Monocular Depth Estimation - Reproduction
 
+**Monodepth2 rebuilt from the papers and trained on KITTI with no depth labels.**
+
 A from-understanding reproduction of self-supervised monocular depth estimation on KITTI. I'm building this to learn the geometry that underlies visual depth and SLAM - pixel backprojection, camera pose, and the photometric reprojection loss.
 
 **Status:** In progress — active learning project. Starte 08.04.2026;
@@ -8,7 +10,19 @@ A from-understanding reproduction of self-supervised monocular depth estimation 
 
 - R. Garg, V. Kumar B G, G. Carneiro, I. Reid — *Unsupervised CNN for Single View Depth Estimation: Geometry to the Rescue* (ECCV 2016)
 - C. Godard, O. Mac Aodha, G. Brostow — *Unsupervised Monocular Depth Estimation with Left-Right Consistency* (CVPR 2017)
-- C. Godard, O. Mac Aodha, M. Firman, G. Brostow — (Monodepth2, ICCV 2019)
+- C. Godard, O. Mac Aodha, M. Firman, G. Brostow — *Digging Into Self-Supervised Monocular Depth Estimation* (Monodepth2, ICCV 2019)
+
+## What's mine and what's borrowed
+
+Written from scratch, from the papers: the geometry (`backproject`, `transform`, `project`, `warp`), both networks (ResNet18 encoder + skip decoder, PoseNet), the KITTI dataset classes, the training loop, and the evaluation harness.
+
+Copied or closely adapted from [`nianticlabs/monodepth2`](https://github.com/nianticlabs/monodepth2): the pose conversion helpers (`transformation_from_parameters`, `rot_from_axisangle`, `get_translation_matrix`), the `SSIM` module, `loss functions`, `compute_errors`, and the Garg crop constants. These are marked in `warp.py`.
+
+## How it works
+
+A depth network (ImageNet-pretrained ResNet18 encoder, U-Net decoder with skip connections, disparity heads at 4 scales) predicts depth for one frame. A pose network (same encoder, 6 input channels) predicts the camera motion to the previous and next frames. Depth + pose let you warp the neighbours onto the target frame; the difference between the warp and the real frame is the training signal.
+
+The loss has two additive terms: a photometric term (L1 + SSIM, α=0.85), reduced by taking the per-pixel **minimum** over the two neighbours and **auto-masking** pixels better explained by no motion; and **edge-aware smoothness** at 1e-3. Both are averaged over the 4 scales.
 
 ## Running it
 
