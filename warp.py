@@ -4,11 +4,19 @@ import torch.nn.functional as F
 from torchvision.io import read_image
 from torchvision.models import resnet18
 import matplotlib.pyplot as plt
-import numpy as np 
+import numpy as np
+import os
+from glob import glob
 
 CAM = 2
-DRIVE = "./kitti_data/2011_09_26/2011_09_26_drive_0001_sync"
+TRAIN_H, TRAIN_W = 192, 640     
+EPOCHS = 10
+BATCH_SIZE = 4
+DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 CALIB = "./kitti_data/2011_09_26"
+
+DRIVES = sorted(glob(f"{CALIB}/*_sync"))
+DRIVE = f"{CALIB}/2011_09_26_drive_0001_sync" 
 FRAME_T = "0000000000"
 FRAME_S = "0000000001"
 
@@ -56,8 +64,11 @@ def lidar_to_depth(bin_path, cam_calib, velo_calib, H, W, cam=2):
     depth_map[v[order], u[order]] = d[order]
     return depth_map                
 
-def load_image(path):
+def load_image(path, size=None):
     img = read_image(path).float() / 255.0
+    if size is not None:
+        img = F.interpolate(img.unsqueeze(0), size=size, mode="bilinear", align_corners=False)
+        return img
     return img.unsqueeze(0)
 
 def parse_intrinsics(path, cam):
@@ -68,47 +79,79 @@ def parse_intrinsics(path, cam):
                 P = torch.tensor(vals).reshape(3, 4)
                 return P[:, :3]
 
+def scale_intrinsics(K, src_hw, dst_hw):
+    (src_h, src_w), (dst_h, dst_w) = src_hw, dst_hw
+    K = K.clone()
+    K[0] *= dst_w / src_w
+    K[1] *= dst_h / src_h
+    return K
+
+class KittiPairs(torch.utils.data.Dataset):
+    def __init__(self, drives, cam, size):
+        if isinstance(drives, str):
+            drives = [drives]
+        self.pairs = []
+        for drive in drives:
+            data_dir = os.path.join(drive, f"image_0{cam}", "data")
+            files = sorted(glob(os.path.join(data_dir, "*.png")))
+            self.pairs += [(files[i], files[i + 1]) for i in range(len(files) - 1)]
+        self.size = size
+
+    def __len__(self):
+        return len(self.pairs)
+
+    def __getitem__(self, i):
+        target, source = self.pairs[i]
+        # load_image returns (1,3,H,W); drop the batch dim so DataLoader can add its own
+        return load_image(target, self.size)[0], load_image(source, self.size)[0]
+
 def make_pixel_grid(H, W):
     v, u = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
     ones = torch.ones_like(u)
     return torch.stack([u, v, ones], dim=0).reshape(3, -1).float()
 
 def to_grid_sample_coords(u, v, H, W):
+    # u, v: (B, H*W)  ->  (B, H, W, 2)
     u_n = 2.0 * u / (W - 1) - 1.0
     v_n = 2.0 * v / (H - 1) - 1.0
-    return torch.stack([u_n, v_n], dim=-1).reshape(1, H, W, 2)
+    return torch.stack([u_n, v_n], dim=-1).reshape(-1, H, W, 2)
 
 def backproject(depth, K, pix):
+    # depth: (B, 1, H, W) or (B, H*W);  pix: (3, H*W)  ->  (B, 3, H*W)
     fx = K[0, 0]
     fy = K[1, 1]
     cx = K[0, 2]
     cy = K[1, 2]
 
-    u = pix[0]   
-    v = pix[1] 
+    d = depth.reshape(depth.shape[0], -1)   # (B, N)
+    u = pix[0]                              # (N,), broadcasts over the batch
+    v = pix[1]
 
-    X = (u - cx) * depth / fx 
-    Y = (v - cy) * depth / fy 
-    Z = depth
+    X = (u - cx) * d / fx
+    Y = (v - cy) * d / fy
+    Z = d
 
-    return torch.stack([X, Y, Z], dim=0) 
-    
+    return torch.stack([X, Y, Z], dim=1)
+
 def transform(points, pose):
-    ones = torch.ones(1, points.shape[1])   
-    points_h = torch.cat([points, ones], dim=0)  
+    # points: (B, 3, N),  pose: (B, 4, 4)  ->  (B, 3, N)
+    B, _, N = points.shape
+    ones = torch.ones(B, 1, N, device=points.device, dtype=points.dtype)
+    points_h = torch.cat([points, ones], dim=1)
 
-    transformed_h = pose @ points_h 
-    return transformed_h[:3] 
+    transformed_h = pose @ points_h
+    return transformed_h[:, :3]
 
 def project(points, K):
-    p = K @ points  
-    u = p[0] / p[2].clamp(min=1e-3) 
-    v = p[1] / p[2].clamp(min=1e-3) 
-    return u,v 
+    # points: (B, 3, N),  K: (3, 3) broadcasts over the batch
+    p = K @ points
+    u = p[:, 0] / p[:, 2].clamp(min=1e-3)
+    v = p[:, 1] / p[:, 2].clamp(min=1e-3)
+    return u, v
 
 def warp(source_img, depth, K, pose, H, W):
-    pix = make_pixel_grid(H, W)            
-    cam_pts = backproject(depth.reshape(-1), K, pix)
+    pix = make_pixel_grid(H, W).to(depth.device)
+    cam_pts = backproject(depth, K, pix)
     src_pts = transform(cam_pts, pose)
     u, v = project(src_pts, K)
     grid = to_grid_sample_coords(u, v, H, W)
@@ -143,17 +186,17 @@ class DepthNetowkr(nn.Module):
         enc = resnet18(weights=None)
         self.enc = nn.Sequential(*list(enc.children())[:-2]) # without avgpool + fc
         self.dec = nn.Sequential(
-            nn.Upsample(scale_factor=2),             
-            nn.Conv2d(512, 256, 3, padding=1), nn.ReLU(),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(),
+            nn.Conv2d(512, 256, 3, padding=1), nn.BatchNorm2d(256), nn.ReLU(),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(128, 64, 3, padding=1),  nn.ReLU(),
+            nn.Conv2d(256, 128, 3, padding=1), nn.BatchNorm2d(128), nn.ReLU(),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(64, 32, 3, padding=1),   nn.ReLU(),
+            nn.Conv2d(128, 64, 3, padding=1),  nn.BatchNorm2d(64),  nn.ReLU(),
             nn.Upsample(scale_factor=2),
-            nn.Conv2d(32, 16, 3, padding=1),   nn.ReLU(),
-            nn.Conv2d(16, 1, 3, padding=1),    nn.Sigmoid(),   
+            nn.Conv2d(64, 32, 3, padding=1),   nn.BatchNorm2d(32),  nn.ReLU(),
+            nn.Upsample(scale_factor=2),
+            nn.Conv2d(32, 16, 3, padding=1),   nn.BatchNorm2d(16),  nn.ReLU(),
+            nn.Conv2d(16, 1, 3, padding=1),    nn.Sigmoid(),
         )
 
     def forward(self, x):
@@ -267,51 +310,61 @@ def photometric_loss(ssim_m, i_w, i_t, alpha=0.85):
     return alpha * ssim + (1 - alpha) * l1
 
 if __name__ == "__main__":
-    target = load_image(target_loc)
-    source = load_image(source_loc)
-    _, _, H, W = target.shape
+    H, W = TRAIN_H, TRAIN_W
 
-    K = parse_intrinsics(calib_loc, CAM)
+    dataset = KittiPairs(DRIVES, CAM, (H, W))
+    loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    depth_net = DepthNetowkr()         
-    pose_net  = PoseNetwork()
-    ssim_m    = SSIM()
+    full_h, full_w = read_image(dataset.pairs[0][0]).shape[-2:]
+    K = scale_intrinsics(parse_intrinsics(calib_loc, CAM), (full_h, full_w), (H, W)).to(DEVICE)
+
+    depth_net = DepthNetowkr().to(DEVICE)
+    pose_net  = PoseNetwork().to(DEVICE)
+    ssim_m    = SSIM().to(DEVICE)
 
     params = list(depth_net.parameters()) + list(pose_net.parameters())
-    optimizer = torch.optim.Adam(params, lr=1e-5)
+    optimizer = torch.optim.Adam(params, lr=1e-4)
 
-    for step in range(100):
-        # 1. predict
-        depth = depth_net(target)
-        depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=False)
-        axisangle, translation = pose_net(target, source)
-        axisangle   = axisangle.unsqueeze(1)
-        translation = translation.unsqueeze(1)
-        pose = transformation_from_parameters(axisangle, translation)[0]
+    for epoch in range(EPOCHS):
+        running = 0.0
+        for target, source in loader:
+            target, source = target.to(DEVICE), source.to(DEVICE)
 
-        # 2. warp
-        warped = warp(source, depth, K, pose, H, W)
+            # 1. predict
+            depth = depth_net(target)
+            depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=False)
+            axisangle, translation = pose_net(target, source)
+            axisangle   = axisangle.unsqueeze(1)
+            translation = translation.unsqueeze(1)
+            pose = transformation_from_parameters(axisangle, translation)   # (B, 4, 4)
 
-        # 3. score
-        loss = photometric_loss(ssim_m, warped, target)
+            # 2. warp
+            warped = warp(source, depth, K, pose, H, W)
 
-        # 4. learn
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-        g = depth_net.dec[1].weight.grad          # first decoder conv's gradient (adjust index if needed)
-        print("grad is None:", g is None, "| grad norm:", None if g is None else g.norm().item())
-        optimizer.step()
+            # 3. score
+            loss = photometric_loss(ssim_m, warped, target)
 
-        if step % 20 == 0:
-            print(f"step {step:4d}   loss {loss.item():.5f}")
+            # 4. learn
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
+            optimizer.step()
+
+            running += loss.item()
+
+        print(f"epoch {epoch:3d}   mean loss {running / len(loader):.5f}")
+
+    target_full = load_image(target_loc)                 # full res, for display + GT comparison
+    full_h, full_w = target_full.shape[-2:]
 
     depth_net.eval()
     with torch.no_grad():
-        depth = depth_net(target)
-        depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=False)
+        depth = depth_net(load_image(target_loc, (H, W)).to(DEVICE))
+        depth = F.interpolate(depth, size=(full_h, full_w), mode="bilinear", align_corners=False)
 
     depth_map = depth[0, 0].cpu()
+    target = target_full
+    H, W = full_h, full_w
 
     fig, ax = plt.subplots(2, 1, figsize=(12, 8))
     ax[0].imshow(target[0].permute(1, 2, 0).clamp(0, 1)); ax[0].set_title("target"); ax[0].axis("off")
