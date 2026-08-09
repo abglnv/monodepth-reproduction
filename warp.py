@@ -10,9 +10,12 @@ from glob import glob
 
 CAM = 2
 TRAIN_H, TRAIN_W = 192, 640     
-EPOCHS = 10
+EPOCHS = 40
 BATCH_SIZE = 4
-SMOOTHNESS_WEIGHT = 1e-3      
+SMOOTHNESS_WEIGHT = 1e-3
+AUTOMASK = True                
+NUM_SCALES = 4                
+EVAL_STRIDE = 3                 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 CALIB = "./kitti_data/2011_09_26"
 
@@ -65,6 +68,62 @@ def lidar_to_depth(bin_path, cam_calib, velo_calib, H, W, cam=2):
     depth_map[v[order], u[order]] = d[order]
     return depth_map                
 
+MIN_DEPTH, MAX_DEPTH = 1e-3, 80.0
+
+def compute_errors(gt, pred):
+    thresh = torch.maximum(gt / pred, pred / gt)
+    a1 = (thresh < 1.25).float().mean()
+    a2 = (thresh < 1.25 ** 2).float().mean()
+    a3 = (thresh < 1.25 ** 3).float().mean()
+    rmse     = ((gt - pred) ** 2).mean().sqrt()
+    rmse_log = ((gt.log() - pred.log()) ** 2).mean().sqrt()
+    abs_rel  = ((gt - pred).abs() / gt).mean()
+    sq_rel   = (((gt - pred) ** 2) / gt).mean()
+    return torch.stack([abs_rel, sq_rel, rmse, rmse_log, a1, a2, a3])
+
+METRIC_NAMES = ["abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3"]
+
+def garg_crop(h, w):
+    m = torch.zeros(h, w, dtype=torch.bool)
+    m[int(0.40810811 * h):int(0.99189189 * h), int(0.03594771 * w):int(0.96405229 * w)] = True
+    return m
+
+def eval_frames(drives, cam):
+    out = []
+    for drive in drives:
+        for img in sorted(glob(os.path.join(drive, f"image_0{cam}", "data", "*.png"))):
+            b = os.path.join(drive, "velodyne_points", "data",
+                             os.path.basename(img).replace(".png", ".bin"))
+            if os.path.exists(b):
+                out.append((img, b))
+    return out
+
+@torch.no_grad()
+def evaluate_depth(depth_net, frames, size, device, stride=1):
+    was_training = depth_net.training
+    depth_net.eval()
+    total, n = torch.zeros(7), 0
+    for img_path, bin_path in frames[::stride]:
+        full_h, full_w = read_image(img_path).shape[-2:]
+        gt = lidar_to_depth(bin_path, calib_cam, calib_velo, full_h, full_w, cam=CAM)
+
+        disp = depth_net(load_image(img_path, size).to(device))[0]   # scale 0, full res
+        _, pred = disp_to_depth(disp)
+        pred = F.interpolate(pred, size=(full_h, full_w), mode="bilinear",
+                             align_corners=False)[0, 0].cpu()
+
+        mask = (gt > MIN_DEPTH) & (gt < MAX_DEPTH) & garg_crop(full_h, full_w)
+        if mask.sum() == 0:
+            continue
+        g, p = gt[mask], pred[mask]
+        p = p * (g.median() / p.median())          # median scaling, per frame
+        p = p.clamp(MIN_DEPTH, MAX_DEPTH)
+        total += compute_errors(g, p)
+        n += 1
+    if was_training:
+        depth_net.train()
+    return total / max(n, 1), n
+
 def load_image(path, size=None):
     img = read_image(path).float() / 255.0
     if size is not None:
@@ -105,6 +164,27 @@ class KittiPairs(torch.utils.data.Dataset):
         target, source = self.pairs[i]
         # load_image returns (1,3,H,W); drop the batch dim so DataLoader can add its own
         return load_image(target, self.size)[0], load_image(source, self.size)[0]
+
+class KittiTriplets(torch.utils.data.Dataset):
+    def __init__(self, drives, cam, size):
+        if isinstance(drives, str):
+            drives = [drives]
+        self.triplets = []
+        for drive in drives:
+            data_dir = os.path.join(drive, f"image_0{cam}", "data")
+            files = sorted(glob(os.path.join(data_dir, "*.png")))
+            self.triplets += [(files[i], files[i - 1], files[i + 1])
+                              for i in range(1, len(files) - 1)]
+        self.size = size
+
+    def __len__(self):
+        return len(self.triplets)
+
+    def __getitem__(self, i):
+        t, p, n = self.triplets[i]
+        return (load_image(t, self.size)[0],
+                load_image(p, self.size)[0],
+                load_image(n, self.size)[0])
 
 def make_pixel_grid(H, W):
     v, u = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
@@ -180,6 +260,11 @@ class SSIM(nn.Module):
 
         return torch.clamp((1 - ssim_n / ssim_d) / 2, 0, 1)
 
+def disp_to_depth(disp, min_depth=0.1, max_depth=100.0):
+    min_disp, max_disp = 1 / max_depth, 1 / min_depth
+    scaled_disp = min_disp + (max_disp - min_disp) * disp
+    return scaled_disp, 1 / scaled_disp
+
 def conv_block(cin, cout):
     return nn.Sequential(nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout), nn.ReLU())
 
@@ -205,7 +290,10 @@ class DepthNetowkr(nn.Module):
             skip_ch = self.CH_ENC[i - 1] if (use_skips and i > 0) else 0
             self.merge.append(conv_block(self.CH_DEC[i] + skip_ch, self.CH_DEC[i]))
 
-        self.disp = nn.Sequential(nn.Conv2d(self.CH_DEC[0], 1, 3, padding=1), nn.Sigmoid())
+        self.disp = nn.ModuleList([
+            nn.Sequential(nn.Conv2d(self.CH_DEC[i], 1, 3, padding=1), nn.Sigmoid())
+            for i in range(NUM_SCALES)
+        ])
 
     def forward(self, x):
         x = (x - 0.45) / 0.225               
@@ -217,17 +305,17 @@ class DepthNetowkr(nn.Module):
         feats = [f0, f1, f2, f3]
 
         y = self.enc4(f3)
+        disps = {}
         for j, i in enumerate(range(4, -1, -1)):
             y = self.up[j](y)
             y = F.interpolate(y, scale_factor=2, mode="nearest")
             if self.use_skips and i > 0:
                 y = torch.cat([y, feats[i - 1]], dim=1)
             y = self.merge[j](y)
+            if i < NUM_SCALES:                 # i = 3,2,1,0 -> H/8, H/4, H/2, H
+                disps[i] = self.disp[i](y)
 
-        disp = self.disp(y)                    # sigmoid, (0, 1)
-        min_disp, max_disp = 1 / 100, 1 / 0.1
-        scaled_disp = min_disp + (max_disp - min_disp) * disp
-        return disp, 1 / scaled_disp
+        return [disps[s] for s in range(NUM_SCALES)]
 
 class PoseNetwork(nn.Module): 
     def __init__(self): 
@@ -347,16 +435,36 @@ def smoothness_loss(disp, img):
 
 def photometric_loss(ssim_m, i_w, i_t, alpha=0.85):
     l1   = (i_w - i_t).abs().mean()
-    ssim = ssim_m(i_w, i_t).mean() 
+    ssim = ssim_m(i_w, i_t).mean()
     return alpha * ssim + (1 - alpha) * l1
+
+def reprojection_loss(ssim_m, pred, target, alpha=0.85):
+    l1   = (pred - target).abs().mean(1, keepdim=True)
+    ssim = ssim_m(pred, target).mean(1, keepdim=True)
+    return alpha * ssim + (1 - alpha) * l1
+
+def min_reprojection_loss(ssim_m, warpeds, sources, target, automask=True):
+    losses = torch.cat([reprojection_loss(ssim_m, p, target) for p in warpeds], dim=1)
+
+    if automask:
+        identity = torch.cat([reprojection_loss(ssim_m, s, target) for s in sources], dim=1)
+        identity = identity + torch.randn_like(identity) * 1e-5   # break exact ties
+        losses = torch.cat([identity, losses], dim=1)
+
+    to_optimise, _ = losses.min(dim=1)
+    return to_optimise.mean()
 
 if __name__ == "__main__":
     H, W = TRAIN_H, TRAIN_W
 
-    dataset = KittiPairs(DRIVES, CAM, (H, W))
+    dataset = KittiTriplets(DRIVES, CAM, (H, W))
     loader = torch.utils.data.DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    frames = eval_frames(DRIVES, CAM)
+    print(f"{len(dataset)} triplets from {len(DRIVES)} drives at {H}x{W}, "
+          f"batch {BATCH_SIZE}, device {DEVICE}")
+    print(f"{len(frames[::EVAL_STRIDE])} eval frames (in-sample: these drives are also trained on)")
 
-    full_h, full_w = read_image(dataset.pairs[0][0]).shape[-2:]
+    full_h, full_w = read_image(dataset.triplets[0][0]).shape[-2:]
     K = scale_intrinsics(parse_intrinsics(calib_loc, CAM), (full_h, full_w), (H, W)).to(DEVICE)
 
     depth_net = DepthNetowkr().to(DEVICE)
@@ -366,26 +474,36 @@ if __name__ == "__main__":
     params = list(depth_net.parameters()) + list(pose_net.parameters())
     optimizer = torch.optim.Adam(params, lr=1e-4)
 
+    best_absrel, best_state = float("inf"), None
     for epoch in range(EPOCHS):
         running = 0.0
-        for target, source in loader:
-            target, source = target.to(DEVICE), source.to(DEVICE)
+        for target, prev, nxt in loader:
+            target, prev, nxt = target.to(DEVICE), prev.to(DEVICE), nxt.to(DEVICE)
 
-            # 1. predict
-            disp, depth = depth_net(target)
-            depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=False)
-            axisangle, translation = pose_net(target, source)
-            axisangle   = axisangle.unsqueeze(1)
-            translation = translation.unsqueeze(1)
-            pose = transformation_from_parameters(axisangle, translation)   # (B, 4, 4)
+            disps = depth_net(target)
 
-            # 2. warp
-            warped = warp(source, depth, K, pose, H, W)
+            aa_p, t_p = pose_net(prev, target)
+            aa_n, t_n = pose_net(target, nxt)
+            pose_prev = transformation_from_parameters(aa_p.unsqueeze(1), t_p.unsqueeze(1), invert=True)
+            pose_next = transformation_from_parameters(aa_n.unsqueeze(1), t_n.unsqueeze(1))
 
-            # 3. score
-            photo  = photometric_loss(ssim_m, warped, target)
-            smooth = smoothness_loss(disp, target)
-            loss   = photo + SMOOTHNESS_WEIGHT * smooth
+            loss = 0.0
+            for s, disp in enumerate(disps):
+                disp_up = disp if s == 0 else F.interpolate(
+                    disp, size=(H, W), mode="bilinear", align_corners=False)
+                _, depth = disp_to_depth(disp_up)
+
+                warped = [warp(prev, depth, K, pose_prev, H, W),
+                          warp(nxt,  depth, K, pose_next, H, W)]
+                photo = min_reprojection_loss(ssim_m, warped, [prev, nxt], target, automask=AUTOMASK)
+
+                color_s = target if s == 0 else F.interpolate(
+                    target, size=disp.shape[-2:], mode="bilinear", align_corners=False)
+                smooth = smoothness_loss(disp, color_s)
+
+                loss = loss + photo + SMOOTHNESS_WEIGHT * smooth / (2 ** s)
+
+            loss = loss / len(disps)
 
             # 4. learn
             optimizer.zero_grad()
@@ -395,31 +513,32 @@ if __name__ == "__main__":
 
             running += loss.item()
 
-        print(f"epoch {epoch:3d}   mean loss {running / len(loader):.5f}")
+        metrics, n_eval = evaluate_depth(depth_net, frames, (H, W), DEVICE, stride=EVAL_STRIDE)
+        line = "  ".join(f"{k} {v:.4f}" for k, v in zip(METRIC_NAMES, metrics.tolist()))
+        print(f"epoch {epoch:3d}  loss {running / len(loader):.5f}  |  {line}")
 
-    target_full = load_image(target_loc)                 # full res, for display + GT comparison
+        if metrics[0] < best_absrel:                      # checkpoint on abs_rel
+            best_absrel = metrics[0].item()
+            best_state = {k: v.detach().cpu().clone() for k, v in depth_net.state_dict().items()}
+
+    print(f"\nbest abs_rel {best_absrel:.4f} over {n_eval} frames")
+    depth_net.load_state_dict(best_state)
+    torch.save(best_state, "depth_net_best.pt")
+    print("saved depth_net_best.pt")
+
+    target_full = load_image(target_loc)
     full_h, full_w = target_full.shape[-2:]
 
     depth_net.eval()
     with torch.no_grad():
-        _, depth = depth_net(load_image(target_loc, (H, W)).to(DEVICE))
-        depth = F.interpolate(depth, size=(full_h, full_w), mode="bilinear", align_corners=False)
+        disp = depth_net(load_image(target_loc, (H, W)).to(DEVICE))[0]
+        disp = F.interpolate(disp, size=(full_h, full_w), mode="bilinear", align_corners=False)
+    disp_map = disp[0, 0].cpu().numpy()
 
-    depth_map = depth[0, 0].cpu()
-    target = target_full
-    H, W = full_h, full_w
+    vmax = np.percentile(disp_map, 95)
 
     fig, ax = plt.subplots(2, 1, figsize=(12, 8))
-    ax[0].imshow(target[0].permute(1, 2, 0).clamp(0, 1)); ax[0].set_title("target"); ax[0].axis("off")
-    ax[1].imshow(depth_map, cmap="magma"); ax[1].set_title("predicted depth"); ax[1].axis("off")
+    ax[0].imshow(target_full[0].permute(1, 2, 0).clamp(0, 1)); ax[0].set_title("target"); ax[0].axis("off")
+    ax[1].imshow(disp_map, cmap="magma", vmin=disp_map.min(), vmax=vmax)
+    ax[1].set_title("predicted disparity (bright = near)"); ax[1].axis("off")
     plt.savefig("depth_result.png"); print("saved depth_result.png")
-
-    gt = lidar_to_depth(bin_loc, calib_cam, calib_velo, H, W, cam=CAM)
-    mask = gt > 0
-    pred, g = depth_map[mask], gt[mask]
-
-    ratio = g.median() / pred.median()
-    abs_rel_raw = ((pred - g).abs() / g).mean()
-    abs_rel = ((pred * ratio - g).abs() / g).mean()
-    print(f"abs_rel vs LiDAR: {abs_rel.item():.4f} (median-scaled, scale {ratio.item():.2f})")
-    print(f"  raw, unscaled:  {abs_rel_raw.item():.4f}   <- dominated by scale, not depth quality")
