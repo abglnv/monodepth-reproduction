@@ -541,4 +541,5 @@ if __name__ == "__main__":
     ax[0].imshow(target_full[0].permute(1, 2, 0).clamp(0, 1)); ax[0].set_title("target"); ax[0].axis("off")
     ax[1].imshow(disp_map, cmap="magma", vmin=disp_map.min(), vmax=vmax)
     ax[1].set_title("predicted disparity (bright = near)"); ax[1].axis("off")
-    plt.savefig("depth_result.png"); print("saved depth_result.png")
+    os.makedirs("assets", exist_ok=True)
+    plt.savefig("assets/depth_result.png"); print("saved assets/depth_result.png")
